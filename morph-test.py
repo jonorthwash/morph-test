@@ -1,13 +1,8 @@
-# A tailored & stand-alone copy of the morph-test.py module of Apertium Quality
-# (http://wiki.apertium.org/wiki/Apertium-quality). Requires at least python3.1
-# but autconf should check that for you. Also requires that you have a proper
-# installation of py-yaml, but that as well should be handled by autoconf/
-# configure.ac.
-#
 # This script is used to run the yaml test cases for morphology & morphophonology
 # tests.
+#
+# License: CC0 (see LICENSE)
 
-from multiprocessing import Process, Manager
 from subprocess import Popen, PIPE
 from argparse import ArgumentParser
 from io import StringIO
@@ -17,7 +12,7 @@ import os
 import os.path
 import re
 import shlex
-#import time
+import shutil
 import sys
 import yaml
 
@@ -41,28 +36,24 @@ def invert_dict(data):
                     d.append(key)
         return tmp
 
+COLORS = {
+    "red": "\033[1;31m",
+    "green": "\033[0;32m",
+    "orange": "\033[0;33m",
+    "yellow": "\033[1;33m",
+    "blue": "\033[0;34m",
+    "light_blue": "\033[0;36m",
+    "reset": "\033[m"
+}
+
 def colourise(string, *args, **kwargs):
-    colors = {
-        "red": "\033[1;31m",
-        "green": "\033[0;32m",
-        "orange": "\033[0;33m",
-        "yellow": "\033[1;33m",
-        "blue": "\033[0;34m",
-        "light_blue": "\033[0;36m",
-        "reset": "\033[m"
-    }
-    kwargs.update(colors)
+    kwargs.update(COLORS)
     return string.format(*args, **kwargs)
 
-def check_path_exists(programs):
-    out = {}
-    for p in programs:
-        for path in os.environ.get('PATH', '').split(':'):
-            if os.path.exists(os.path.join(path, p)) and \
-               not os.path.isdir(os.path.join(path, p)):
-                    out[p] = os.path.join(path, p)
-        if not out.get(p):
-            raise EnvironmentError("Cannot find `%s`. Check $PATH." % p)
+def check_path_exists(program):
+    out = shutil.which(program)
+    if out is None:
+        raise EnvironmentError("Cannot find `%s`. Check $PATH." % program)
     return out
 
 # SUPPORT CLASSES
@@ -147,7 +138,12 @@ class TestFile:
     def app(self):
         a = self.data.get("Config", {}).get(self._system, {}).get("App", None)
         if a is None:
-            a = "hfst-lookup" if self._system == "hfst" else "lookup"
+            if self._system == "hfst":
+                return ['hfst-lookup']
+            elif self._system == "xerox":
+                return ["lookup", "-flags", "mbTT"]
+            else:
+                raise Exception("Unknown system: '%s'" % self._system)
         return a
 
 class MorphTest:
@@ -234,7 +230,7 @@ class MorphTest:
         def final_result(self, counts):
             p = counts.passes
             f = counts.fails
-            self.write("Total %d/%d/%d\n" % (p, f, p+f))
+            self.write("%d/%d/%d " % (p, f, p+f))
 
     class NoOutput(AllOutput):
         def final_result(self, *args):
@@ -269,14 +265,17 @@ class MorphTest:
                     args.morph,
                     args.app,
                     args.transducer,
-                    args.section))
+                    args.section), args.section)
         else:
-            self.config = TestFile(yaml_load_ordered(open(fn)))
+            self.config = TestFile(yaml_load_ordered(open(fn)), args.section)
 
         config = self.config
 
-        self.program = shlex.split(args.app or config.app)
-        check_path_exists([self.program[0]])
+        app = args.app or config.app
+        if isinstance(app, str):
+            app = app.split(" ")
+        self.program = string_to_list(app)
+        check_path_exists(self.program[0])
 
         self.gen = args.gen or config.gen
         self.morph = args.morph or config.morph
@@ -310,9 +309,9 @@ class MorphTest:
         if args.verbose:
             self.out.info("`%s` will be used for parsing dictionaries.\n" % self.program[0])
 
-        # TODO: reintroduce the removal of colour!
-        #if not args.colour:
-        #    colourise = lambda x, y=None: x
+        if not args.colour:
+            for key in list(COLORS.keys()):
+                COLORS[key] = ""
 
     def run_tests(self, single_test=None):
         args = self.args
@@ -341,8 +340,7 @@ class MorphTest:
 
     def parse_fsts(self, key=None):
         args = self.args
-        manager = Manager()
-        self.results = manager.dict({"gen": {}, "morph": {}})
+        self.results = {"gen": {}, "morph": {}}
 
         def parser(self, d, f, tests):
             # TODO: handle ~ in file parser
@@ -365,21 +363,14 @@ class MorphTest:
                 self.results[d] = self.parse_fst_output(res)
 
         if args.lexical:
-            gen = Process(target=parser, args=(self, "gen", self.gen, self.config.surface_tests))
-            gen.start()
+            parser(self, "gen", self.gen, self.config.surface_tests)
             if self.args.verbose:
                 self.out.info("Generating...\n")
 
         if args.surface:
-            morph = Process(target=parser, args=(self, "morph", self.morph, self.config.lexical_tests))
-            morph.start()
+            parser(self, "morph", self.morph, self.config.lexical_tests)
             if self.args.verbose:
                 self.out.info("Morphing...\n")
-
-        if args.lexical:
-            gen.join()
-        if args.surface:
-            morph.join()
 
         if self.args.verbose:
             self.out.info("Done!\n")
@@ -410,6 +401,8 @@ class MorphTest:
             f = "morph"
             tests = self.config.lexical_tests[data]
 
+        res = self.results[f]
+
         if self.results.get('err'):
             raise LookupError('`%s` had an error:\n%s' % (self.program, self.results['err']))
 
@@ -427,7 +420,7 @@ class MorphTest:
             test = testcase.input
             forms = testcase.outputs
 
-            actual_results = set(self.results[f][test.lstrip("~")])
+            actual_results = set(res[test.lstrip("~")])
             test, detested_results, expected_results = self.get_forms(test, forms)
 
             missing = set()
@@ -475,14 +468,14 @@ class MorphTest:
                 if not self.args.hide_fail:
                     self.out.failure(n, caseslen, test, "Missing results", missing)
                 #self.count[d]["Fail"] += len(missing)
-            
+
             if len(invalid) > 0:
                 if not is_lexical and self.args.ignore_analyses:
                     invalid = set() # hide this for the final check
                 elif not self.args.hide_fail:
                     self.out.failure(n, caseslen, test, "Unexpected results", invalid)
                 #self.count[d]["Fail"] += len(invalid)
-            
+
             if len(detested) > 0:
                 if self.args.colour:
                     msg = colourise("{red}BROKEN!{reset}")
@@ -522,10 +515,14 @@ class MorphTest:
     def __str__(self):
         return str(self.out)
 
-
+# Debug regex at: https://debuggex.com
+# Visualisation of the TEST_RE regex:
+# https://debuggex.com/i/kURzt7XS3t83-dvT.png
+# Link to debuggex page with this regex:
+# https://debuggex.com/r/kURzt7XS3t83-dvT
 def parse_lexc(f, fallback=None):
-    HEADER_RE = re.compile(r'^\!\!€([^\s:]+):\s*([^#]+)\s*#?')
-    TEST_RE = re.compile(r'^\!\!([€\$])\s+(\S+)\s+(\S+)\s*#?')
+    HEADER_RE = re.compile(r'^\!\!€([^\s.:]+)(?:.[^\s:]+)?:\s*([^#]+)\s*#?')
+    TEST_RE = re.compile(r'^\!\!([€\$])\s+(\S.*):\s+(\S+|\S.*\S)(\s*$|\s+[#!])')
     POS = "€"
     NEG = "$"
 
@@ -558,9 +555,9 @@ def parse_lexc(f, fallback=None):
                 continue
 
             if TEST_RE.match(line):
-                test_type = match.group(1)
-                left = match.group(3)
-                right = match.group(2)
+                test_type = match.group(1).strip()
+                left = match.group(3).strip()
+                right = match.group(2).strip()
 
                 if test_type == NEG:
                     right = "~" + right
@@ -584,8 +581,8 @@ def parse_lexc_trans(f, gen=None, morph=None, app=None, fallback=None, lookup="h
 
     lexc = parse_lexc(f, fallback)[trans]
     if app is None:
-        app = "hfst-lookup" if lookup == "hfst" else "lookup"
-    config = {lookup: {"Gen": gen, "Morph": morph, "App": app}}
+        app = ["hfst-lookup"] if lookup == "hfst" else ["lookup", "-flags", "mbTT"]
+    config = {lookup: {"Gen": gen, "Morph": morph, "App": string_to_list(app)}}
     return {"Config": config, "Tests": lexc}
 
 def lexc_to_yaml_string(data):
@@ -606,16 +603,14 @@ class UI(ArgumentParser):
     def __init__(self):
         ArgumentParser.__init__(self)
 
-        self.description="""Test morphological transducers for consistency.
-            `hfst-lookup` (or Xerox' `lookup` with argument -x) must be
-            available on the PATH."""
+        self.description="""Test morphological transducers for consistency."""
         self.epilog="Will run all tests in the test_file by default."
 
         self.add_argument("-c", "--colour", dest="colour",
             action="store_true", help="Colours the output")
         self.add_argument("-o", "--output",
             dest="output", default="normal",
-            help="Desired output style: compact, terse, final, normal (Default: normal)")
+            help="Desired output style: normal, compact, terse, final (Default: normal)")
         self.add_argument("-q", "--silent",
             dest="silent", action="store_true",
             help="Hide all output; exit code only")
@@ -631,11 +626,11 @@ class UI(ArgumentParser):
             help="Lexical input/generation tests only")
         self.add_argument("-f", "--hide-fails",
             dest="hide_fail", action="store_true",
-            help="Suppresses passes to make finding failures easier")
+            help="Suppresses fails to make finding passes easier")
         self.add_argument("-p", "--hide-passes",
             dest="hide_pass", action="store_true",
-            help="Suppresses failures to make finding passes easier")
-        self.add_argument("-S", "--section", default=["hfst"],
+            help="Suppresses passes to make finding fails easier")
+        self.add_argument("-S", "--section", default="hfst",
             dest="section", nargs='?', required=False,
             help="The section to be used for testing (default is `hfst`)")
         self.add_argument("-t", "--test",
@@ -644,7 +639,7 @@ class UI(ArgumentParser):
             'Noun - g\u00E5etie' (remember quotes if the ID contains spaces)""")
         self.add_argument("-F", "--fallback",
             dest="transducer", nargs='?', required=False,
-            help="""Which fallback transducer to use.""")
+            help="""Which fallback transducer to use (ignored, use --gen and --morph).""")
         self.add_argument("-v", "--verbose",
             dest="verbose", action="store_true",
             help="More verbose output.")
@@ -656,7 +651,7 @@ class UI(ArgumentParser):
         self.add_argument("--morph", dest="morph", nargs='?', required=False,
             help="Override morph transducer used for test")
 
-        self.add_argument("test_file", nargs='?',
+        self.add_argument("test_file",
             help="YAML file with test rules")
 
         self.test = MorphTest(self.parse_args())
